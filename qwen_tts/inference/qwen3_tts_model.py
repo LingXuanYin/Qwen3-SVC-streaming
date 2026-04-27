@@ -27,6 +27,7 @@ import torch
 from transformers import AutoConfig, AutoModel, AutoProcessor
 
 from ..core.models import Qwen3TTSConfig, Qwen3TTSForConditionalGeneration, Qwen3TTSProcessor
+from ..core.models.configuration_qwen3_tts import Qwen3TTSSVCConfig
 
 AudioLike = Union[
     str,                     # wav path, URL, base64
@@ -875,3 +876,188 @@ class Qwen3TTSModel:
         if supported is None:
             return None
         return sorted(supported)
+
+    # ─── SVC (Singing Voice Conversion) ─────────────────────────────
+
+    _svc_f0_projector = None
+    _svc_content_projector = None
+    _svc_config: Optional[Qwen3TTSSVCConfig] = None
+
+    def load_svc_adapter(self, svc_adapter_path: str) -> None:
+        """Load SVC LoRA adapter, F0 projector, and content projector from checkpoint.
+
+        Args:
+            svc_adapter_path: Path to saved SVC checkpoint directory.
+        """
+        from ..svc.svc_adapter import load_svc_checkpoint
+        device_str = str(self.device)
+        self.model, self._svc_f0_projector, self._svc_content_projector, self._svc_config = load_svc_checkpoint(
+            self.model, svc_adapter_path, device=device_str
+        )
+
+    def _validate_svc_ready(self) -> None:
+        if self._svc_f0_projector is None or self._svc_config is None:
+            raise RuntimeError(
+                "SVC adapter not loaded. Call load_svc_adapter(path) first, "
+                "or pass svc_adapter_path to from_pretrained()."
+            )
+
+    def _validate_audio_duration(self, audio: np.ndarray, sr: int, name: str) -> None:
+        max_dur = self._svc_config.max_audio_duration_seconds if self._svc_config else 60.0
+        duration = len(audio) / sr
+        if duration > max_dur:
+            raise ValueError(
+                f"{name} duration {duration:.1f}s exceeds maximum {max_dur}s."
+            )
+
+    @torch.inference_mode()
+    def generate_svc(
+        self,
+        timbre_ref: AudioLike,
+        source_audio: AudioLike,
+        pitch_ref: AudioLike,
+        pitch_shift: float = 0.0,
+        streaming: bool = False,
+        streaming_chunk_frames: Optional[int] = None,
+        **kwargs,
+    ):
+        """Generate SVC (Singing Voice Conversion) output.
+
+        Args:
+            timbre_ref: Reference audio for target voice timbre.
+            source_audio: Source audio whose content will be converted.
+            pitch_ref: Reference audio for target pitch contour.
+            pitch_shift: Semitone offset to apply to pitch_ref F0.
+            streaming: If True, yields audio chunks as a generator.
+            streaming_chunk_frames: Frames per streaming chunk (default from config).
+            **kwargs: Generation parameters (do_sample, top_k, etc.)
+
+        Returns:
+            If streaming=False: (wavs: List[np.ndarray], sample_rate: int)
+            If streaming=True: generator yielding np.ndarray audio chunks
+        """
+        from ..svc.f0_extractor import extract_f0, align_f0_to_codec, pitch_shift as apply_pitch_shift
+        from ..svc.svc_model import build_svc_prefill
+
+        self._validate_svc_ready()
+
+        # Load and validate audios
+        timbre_wav, timbre_sr = self._normalize_audio_inputs(timbre_ref)[0]
+        source_wav, source_sr = self._normalize_audio_inputs(source_audio)[0]
+        pitch_wav, pitch_sr = self._normalize_audio_inputs(pitch_ref)[0]
+
+        self._validate_audio_duration(source_wav, source_sr, "source_audio")
+        self._validate_audio_duration(pitch_wav, pitch_sr, "pitch_ref")
+
+        device_str = str(self.device)
+
+        # 1. Extract speaker embedding from timbre reference
+        timbre_24k = timbre_wav
+        if timbre_sr != self.model.speaker_encoder_sample_rate:
+            timbre_24k = librosa.resample(
+                y=timbre_wav.astype(np.float32),
+                orig_sr=int(timbre_sr),
+                target_sr=self.model.speaker_encoder_sample_rate,
+            )
+        speaker_embedding = self.model.extract_speaker_embedding(
+            audio=timbre_24k, sr=self.model.speaker_encoder_sample_rate
+        )
+
+        # 2. Encode source audio to codec tokens
+        enc = self.model.speech_tokenizer.encode(source_wav, sr=source_sr)
+        source_codes = enc.audio_codes[0]  # (T, num_quantizers) for 12Hz
+        T = source_codes.shape[0]
+
+        # 3. Extract F0 from pitch reference and align to codec frames
+        f0_raw = extract_f0(pitch_wav, pitch_sr, device=device_str)
+        f0_aligned = align_f0_to_codec(f0_raw, target_length=T)
+
+        # 4. Apply pitch shift
+        if pitch_shift != 0.0:
+            f0_aligned = apply_pitch_shift(f0_aligned, pitch_shift)
+
+        # 5. Project F0 to embedding
+        f0_embedding = self._svc_f0_projector(
+            f0_aligned.to(self.device)
+        )  # (T, hidden_size)
+
+        # 6. Build SVC prefill
+        non_streaming = not streaming
+        input_embeds, attention_mask, trailing_text_hidden, tts_pad_embed = build_svc_prefill(
+            model=self.model,
+            source_codes=source_codes,
+            f0_embedding=f0_embedding,
+            speaker_embedding=speaker_embedding,
+            non_streaming_mode=non_streaming,
+            content_projector=self._svc_content_projector,
+        )
+
+        # 7. Generate codec tokens
+        gen_kwargs = self._merge_generate_kwargs(**kwargs)
+        talker_kwargs = {
+            "max_new_tokens": gen_kwargs.get("max_new_tokens", 2048),
+            "min_new_tokens": 2,
+            "do_sample": gen_kwargs.get("do_sample", True),
+            "top_k": gen_kwargs.get("top_k", 50),
+            "top_p": gen_kwargs.get("top_p", 1.0),
+            "temperature": gen_kwargs.get("temperature", 0.9),
+            "subtalker_dosample": gen_kwargs.get("subtalker_dosample", True),
+            "subtalker_top_k": gen_kwargs.get("subtalker_top_k", 50),
+            "subtalker_top_p": gen_kwargs.get("subtalker_top_p", 1.0),
+            "subtalker_temperature": gen_kwargs.get("subtalker_temperature", 0.9),
+            "eos_token_id": self.model.config.talker_config.codec_eos_token_id,
+            "repetition_penalty": gen_kwargs.get("repetition_penalty", 1.05),
+            "suppress_tokens": [
+                i for i in range(
+                    self.model.config.talker_config.vocab_size - 1024,
+                    self.model.config.talker_config.vocab_size,
+                )
+                if i != self.model.config.talker_config.codec_eos_token_id
+            ],
+            "output_hidden_states": True,
+            "return_dict_in_generate": True,
+        }
+
+        talker_result = self.model.talker.generate(
+            inputs_embeds=input_embeds,
+            attention_mask=attention_mask,
+            trailing_text_hidden=trailing_text_hidden,
+            tts_pad_embed=tts_pad_embed,
+            **talker_kwargs,
+        )
+
+        # 8. Extract codec tokens
+        talker_codes = torch.stack(
+            [hid[-1] for hid in talker_result.hidden_states if hid[-1] is not None], dim=1
+        )
+
+        # Find EOS and truncate
+        first_codebook = talker_codes[:, :, 0]
+        is_stop = first_codebook == self.model.config.talker_config.codec_eos_token_id
+        stop_idx = torch.argmax(is_stop.int(), dim=1)
+        has_stop = is_stop.any(dim=1)
+        eff_len = torch.where(has_stop, stop_idx, talker_codes.shape[1])
+        codes = talker_codes[0, :eff_len[0]]  # (gen_T, num_groups)
+
+        if streaming:
+            return self._svc_streaming_decode(codes, streaming_chunk_frames)
+
+        # 9. Decode all at once
+        wavs, fs = self.model.speech_tokenizer.decode([{"audio_codes": codes}])
+        return wavs, fs
+
+    def _svc_streaming_decode(self, codes: torch.Tensor, chunk_frames: Optional[int] = None):
+        """Generator that yields audio chunks from codec tokens.
+
+        Args:
+            codes: (T, num_groups) codec tokens.
+            chunk_frames: Frames per chunk. Default from svc_config.
+        """
+        if chunk_frames is None:
+            chunk_frames = self._svc_config.streaming_chunk_frames if self._svc_config else 4
+        T = codes.shape[0]
+        for start in range(0, T, chunk_frames):
+            end = min(start + chunk_frames, T)
+            chunk_codes = codes[start:end]
+            wavs, fs = self.model.speech_tokenizer.decode([{"audio_codes": chunk_codes}])
+            yield wavs[0]

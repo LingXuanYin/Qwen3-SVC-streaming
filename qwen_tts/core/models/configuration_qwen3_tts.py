@@ -474,6 +474,9 @@ class Qwen3TTSConfig(PretrainedConfig):
         tts_pad_token_id=151671,
         tts_bos_token_id=151672,
         tts_eos_token_id=151673,
+        svc_adapter_path=None,
+        svc_enabled=False,
+        svc_config=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -498,5 +501,48 @@ class Qwen3TTSConfig(PretrainedConfig):
         self.tts_bos_token_id = tts_bos_token_id
         self.tts_eos_token_id = tts_eos_token_id
 
+        self.svc_adapter_path = svc_adapter_path
+        self.svc_enabled = svc_enabled
+        self.svc_config = svc_config if isinstance(svc_config, dict) else (svc_config or {})
 
-__all__ = ["Qwen3TTSConfig", "Qwen3TTSTalkerConfig", "Qwen3TTSSpeakerEncoderConfig"]
+
+class Qwen3TTSSVCConfig:
+    """Configuration for SVC (Singing Voice Conversion) adapter."""
+
+    def __init__(
+        self,
+        f0_extractor_type: str = "fcpe",
+        f0_hop_size: int = 160,
+        f0_sample_rate: int = 16000,
+        lora_rank: int = 32,
+        lora_alpha: int = 64,
+        lora_target_modules: list = None,
+        sub_talker_lora_rank: int = 16,
+        max_audio_duration_seconds: float = 60.0,
+        f0_threshold: float = 0.006,
+        streaming_chunk_frames: int = 4,
+        sub_talker_loss_weight: float = 0.3,
+    ):
+        self.f0_extractor_type = f0_extractor_type
+        self.f0_hop_size = f0_hop_size
+        self.f0_sample_rate = f0_sample_rate
+        self.lora_rank = lora_rank
+        self.lora_alpha = lora_alpha
+        self.lora_target_modules = lora_target_modules or [
+            "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj",
+        ]
+        self.sub_talker_lora_rank = sub_talker_lora_rank
+        self.max_audio_duration_seconds = max_audio_duration_seconds
+        self.f0_threshold = f0_threshold
+        self.streaming_chunk_frames = streaming_chunk_frames
+        self.sub_talker_loss_weight = sub_talker_loss_weight
+
+    def to_dict(self):
+        return self.__dict__.copy()
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(**d)
+
+
+__all__ = ["Qwen3TTSConfig", "Qwen3TTSTalkerConfig", "Qwen3TTSSpeakerEncoderConfig", "Qwen3TTSSVCConfig"]
